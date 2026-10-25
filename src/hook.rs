@@ -57,11 +57,15 @@ struct Decoder {
     vtable: *const usize,
     codec: Codec,
     state: Mutex<DecoderState>,
+    callback: Arc<DecoderCallback>,
 }
 
 struct DecoderState {
     backend: Option<Arc<Backend>>,
-    callback: *mut c_void,
+}
+
+struct DecoderCallback {
+    callback: AtomicUsize,
 }
 
 #[repr(align(16))]
@@ -275,7 +279,7 @@ unsafe extern "C" fn hooked_create(
     };
     let codec_type: CodecType = unsafe { mem::transmute(addresses.get(elf::CODEC_TYPE)) };
     if let Some(codec) = Codec::from_webrtc(unsafe { codec_type(format) }) {
-        let mut decoder = Box::new(Decoder {
+        let decoder = Box::new(Decoder {
             vtable: DECODER_VTABLE
                 .get_or_init(|| {
                     [
@@ -293,16 +297,12 @@ unsafe extern "C" fn hooked_create(
                 })
                 .as_ptr(),
             codec,
-            state: Mutex::new(DecoderState {
-                backend: None,
-                callback: ptr::null_mut(),
+            state: Mutex::new(DecoderState { backend: None }),
+            callback: Arc::new(DecoderCallback {
+                callback: AtomicUsize::new(0),
             }),
         });
-        if let Some(backend) = Backend::new(
-            codec,
-            on_nvdec_frame,
-            (&mut *decoder as *mut Decoder).cast(),
-        ) {
+        if let Some(backend) = Backend::new(codec, on_nvdec_frame, Arc::clone(&decoder.callback)) {
             decoder.state.lock().expect("new decoder state").backend = Some(backend);
             eprintln!(
                 "discord-nvdec: {} selected for NVDEC decoding",
@@ -326,7 +326,9 @@ unsafe extern "C" fn decoder_destroy(decoder: *mut Decoder) {
 
 unsafe extern "C" fn decoder_delete(decoder: *mut Decoder) {
     if !decoder.is_null() {
-        unsafe { drop(Box::from_raw(decoder)) };
+        let decoder = unsafe { Box::from_raw(decoder) };
+        decoder.callback.callback.store(0, Ordering::Release);
+        drop(decoder);
     }
 }
 
@@ -343,11 +345,7 @@ unsafe extern "C" fn decoder_configure(decoder: *mut Decoder, settings: *const u
         return false;
     };
     if state.backend.is_none() {
-        state.backend = Backend::new(
-            decoder.codec,
-            on_nvdec_frame,
-            (decoder as *const Decoder).cast_mut().cast(),
-        );
+        state.backend = Backend::new(decoder.codec, on_nvdec_frame, Arc::clone(&decoder.callback));
     }
     state.backend.is_some()
 }
@@ -412,10 +410,10 @@ unsafe extern "C" fn decoder_register_callback(
     let Some(decoder) = (unsafe { decoder.as_ref() }) else {
         return -1;
     };
-    let Ok(mut state) = decoder.state.lock() else {
-        return -1;
-    };
-    state.callback = callback;
+    decoder
+        .callback
+        .callback
+        .store(callback as usize, Ordering::Release);
     0
 }
 
@@ -459,13 +457,9 @@ fn on_nvdec_frame(context: *mut c_void, nv12: &[u8], width: i32, height: i32, ti
     if context.is_null() || width <= 0 || height <= 0 {
         return;
     }
-    let decoder = context.cast::<Decoder>();
-    let callback = unsafe { &*decoder }
-        .state
-        .lock()
-        .ok()
-        .map(|state| state.callback)
-        .unwrap_or(ptr::null_mut());
+    let callback = unsafe { &*context.cast::<DecoderCallback>() }
+        .callback
+        .load(Ordering::Acquire) as *mut c_void;
     if callback.is_null() {
         return;
     }
@@ -577,7 +571,42 @@ unsafe fn release_buffer(buffer: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::nv12_to_i420;
+    use super::{
+        Codec, Decoder, DecoderCallback, DecoderState, decoder_delete, nv12_to_i420, on_nvdec_frame,
+    };
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    #[test]
+    fn callback_context_survives_decoder_delete() {
+        let callback = Arc::new(DecoderCallback {
+            callback: AtomicUsize::new(1),
+        });
+        let decoder = Box::into_raw(Box::new(Decoder {
+            vtable: ptr::null(),
+            codec: Codec::H264,
+            state: Mutex::new(DecoderState { backend: None }),
+            callback: Arc::clone(&callback),
+        }));
+        let in_flight = Arc::clone(&callback);
+        drop(callback);
+        let ready = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let worker_resume = Arc::clone(&resume);
+        let worker = std::thread::spawn(move || {
+            let context = Arc::as_ptr(&in_flight).cast_mut().cast();
+            worker_ready.wait();
+            worker_resume.wait();
+            on_nvdec_frame(context, &[0; 6], 2, 2, 0);
+            assert_eq!(in_flight.callback.load(Ordering::Acquire), 0);
+        });
+        ready.wait();
+        unsafe { decoder_delete(decoder) };
+        resume.wait();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn converts_nv12_to_i420() {

@@ -67,6 +67,7 @@ struct State {
     bit_depth_minus8: u8,
     callback: FrameCallback,
     callback_context: *mut c_void,
+    _callback_context_owner: Arc<dyn Send + Sync>,
     failed: bool,
 }
 
@@ -168,8 +169,14 @@ fn normalize_av1_packet(data: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
 }
 
 impl Backend {
-    pub fn new(codec: Codec, callback: FrameCallback, context: *mut c_void) -> Option<Arc<Self>> {
-        let backend = Arc::new(Self {
+    fn allocate<Context: Send + Sync + 'static>(
+        codec: Codec,
+        callback: FrameCallback,
+        context: Arc<Context>,
+    ) -> Arc<Self> {
+        let callback_context = Arc::as_ptr(&context).cast_mut().cast();
+        let callback_context_owner: Arc<dyn Send + Sync> = context;
+        Arc::new(Self {
             state: UnsafeCell::new(State {
                 codec,
                 cuda_context: ptr::null_mut(),
@@ -181,13 +188,23 @@ impl Backend {
                 height: 0,
                 bit_depth_minus8: 0,
                 callback,
-                callback_context: context,
+                callback_context,
+                // The parser can retain this pointer until the final Backend reference is dropped.
+                _callback_context_owner: callback_context_owner,
                 failed: false,
             }),
             busy: AtomicBool::new(false),
             trace_enabled: std::env::var_os("DISCORD_NVDEC_TRACE").is_some(),
             traced_packets: AtomicUsize::new(0),
-        });
+        })
+    }
+
+    pub fn new<Context: Send + Sync + 'static>(
+        codec: Codec,
+        callback: FrameCallback,
+        context: Arc<Context>,
+    ) -> Option<Arc<Self>> {
+        let backend = Self::allocate(codec, callback, context);
         let state = unsafe { &mut *backend.state.get() };
         let mut device = 0;
         if unsafe { ffi::cuInit(0) } != 0
@@ -556,11 +573,50 @@ fn copy_mapped_frame(state: &mut State, source: u64, source_pitch: usize) -> Res
 mod tests {
     use super::{Backend, Codec};
     use std::ffi::c_void;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FrameResult {
         count: AtomicUsize,
         invalid: AtomicBool,
+    }
+
+    struct OwnedContext {
+        count: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for OwnedContext {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    fn count_frame(context: *mut c_void, _: &[u8], _: i32, _: i32, _: u32) {
+        let context = unsafe { &*context.cast::<OwnedContext>() };
+        context.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn in_flight_backend_owns_callback_context() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let context = Arc::new(OwnedContext {
+            count: AtomicUsize::new(0),
+            dropped: Arc::clone(&dropped),
+        });
+        let backend = Backend::allocate(Codec::H264, count_frame, Arc::clone(&context));
+        let in_flight = Arc::clone(&backend);
+        drop(backend);
+        drop(context);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        let state = unsafe { &*in_flight.state.get() };
+        (state.callback)(state.callback_context, &[], 0, 0, 0);
+        let context = unsafe { &*state.callback_context.cast::<OwnedContext>() };
+        assert_eq!(context.count.load(Ordering::Relaxed), 1);
+
+        drop(in_flight);
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     fn on_frame(context: *mut c_void, frame: &[u8], width: i32, height: i32, _: u32) {
@@ -572,16 +628,12 @@ mod tests {
     }
 
     fn decode_stream(codec: Codec, packets: impl IntoIterator<Item = (Vec<u8>, u32, bool)>) {
-        let result = FrameResult {
+        let result = Arc::new(FrameResult {
             count: AtomicUsize::new(0),
             invalid: AtomicBool::new(false),
-        };
-        let backend = Backend::new(
-            codec,
-            on_frame,
-            (&result as *const FrameResult).cast_mut().cast(),
-        )
-        .expect("GPU codec support");
+        });
+        let backend =
+            Backend::new(codec, on_frame, Arc::clone(&result)).expect("GPU codec support");
         for (packet, timestamp, end_of_picture) in packets {
             backend.submit(&packet, timestamp, end_of_picture).unwrap();
         }
@@ -678,16 +730,11 @@ mod tests {
         let mut packet = frame[2..16].to_vec();
         packet[13] = 0x30;
         packet.extend_from_slice(&frame[18..]);
-        let result = FrameResult {
+        let result = Arc::new(FrameResult {
             count: AtomicUsize::new(0),
             invalid: AtomicBool::new(false),
-        };
-        let backend = Backend::new(
-            Codec::Av1,
-            on_frame,
-            (&result as *const FrameResult).cast_mut().cast(),
-        )
-        .unwrap();
+        });
+        let backend = Backend::new(Codec::Av1, on_frame, Arc::clone(&result)).unwrap();
         backend.submit(&packet, 1234, true).unwrap();
         backend.flush().unwrap();
         assert_eq!(result.count.load(Ordering::Relaxed), 1);
