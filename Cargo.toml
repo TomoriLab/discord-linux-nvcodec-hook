@@ -1,0 +1,17 @@
+[package]
+name = "discord_nvenc_nvdec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Experimental NVIDIA NVDEC and NVENC hook for Discord Linux"
+repository = "https://github.com/zeroday0619/discord-linux-nvcodec-hook"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
