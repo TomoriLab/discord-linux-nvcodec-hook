@@ -1,11 +1,11 @@
 use crate::ffi;
+use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const HEVC: ffi::cudaVideoCodec = ffi::cudaVideoCodec_enum_cudaVideoCodec_HEVC;
 const CHROMA_420: ffi::cudaVideoChromaFormat =
     ffi::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_420;
 const NV12: ffi::cudaVideoSurfaceFormat =
@@ -17,7 +17,46 @@ const WEAVE: ffi::cudaVideoDeinterlaceMode =
 
 type FrameCallback = fn(*mut c_void, &[u8], i32, i32, u32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    Vp8,
+    Av1,
+    H264,
+    Hevc,
+}
+
+impl Codec {
+    pub fn from_webrtc(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Vp8),
+            3 => Some(Self::Av1),
+            4 => Some(Self::H264),
+            5 => Some(Self::Hevc),
+            _ => None,
+        }
+    }
+
+    fn cuda(self) -> ffi::cudaVideoCodec {
+        match self {
+            Self::Vp8 => ffi::cudaVideoCodec_enum_cudaVideoCodec_VP8,
+            Self::Av1 => ffi::cudaVideoCodec_enum_cudaVideoCodec_AV1,
+            Self::H264 => ffi::cudaVideoCodec_enum_cudaVideoCodec_H264,
+            Self::Hevc => ffi::cudaVideoCodec_enum_cudaVideoCodec_HEVC,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vp8 => "VP8",
+            Self::Av1 => "AV1",
+            Self::H264 => "H264",
+            Self::Hevc => "H265",
+        }
+    }
+}
+
 struct State {
+    codec: Codec,
     cuda_context: ffi::CUcontext,
     parser: ffi::CUvideoparser,
     decoder: ffi::CUvideodecoder,
@@ -34,6 +73,8 @@ struct State {
 pub struct Backend {
     state: UnsafeCell<State>,
     busy: AtomicBool,
+    trace_enabled: bool,
+    traced_packets: AtomicUsize,
 }
 
 // Parser callbacks run synchronously within submit or flush while busy is held.
@@ -70,10 +111,67 @@ fn zeroed<T>() -> T {
     unsafe { std::mem::MaybeUninit::<T>::zeroed().assume_init() }
 }
 
+fn normalize_av1_packet(data: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let header_offset = offset;
+        let header = data[offset];
+        if header & 0x81 != 0 || (header >> 3) & 0x0f == 0 {
+            return Err(());
+        }
+        offset += 1;
+        if header & 0x04 != 0 {
+            if offset == data.len() {
+                return Err(());
+            }
+            offset += 1;
+        }
+        if header & 0x02 == 0 {
+            let mut normalized = Vec::with_capacity(data.len() + 8);
+            normalized.extend_from_slice(&data[..header_offset]);
+            normalized.push(header | 0x02);
+            normalized.extend_from_slice(&data[header_offset + 1..offset]);
+            let mut remaining = data.len() - offset;
+            loop {
+                let mut byte = (remaining & 0x7f) as u8;
+                remaining >>= 7;
+                if remaining != 0 {
+                    byte |= 0x80;
+                }
+                normalized.push(byte);
+                if remaining == 0 {
+                    break;
+                }
+            }
+            normalized.extend_from_slice(&data[offset..]);
+            return Ok(Cow::Owned(normalized));
+        }
+        let mut payload_size = 0_u64;
+        let mut complete = false;
+        for byte_index in 0..8 {
+            let Some(&byte) = data.get(offset) else {
+                return Err(());
+            };
+            offset += 1;
+            payload_size |= u64::from(byte & 0x7f) << (byte_index * 7);
+            if byte & 0x80 == 0 {
+                complete = true;
+                break;
+            }
+        }
+        if !complete || payload_size > (data.len() - offset) as u64 {
+            return Err(());
+        }
+        offset += payload_size as usize;
+    }
+    Ok(Cow::Borrowed(data))
+}
+
 impl Backend {
-    pub fn new(callback: FrameCallback, context: *mut c_void) -> Option<Arc<Self>> {
+    pub fn new(codec: Codec, callback: FrameCallback, context: *mut c_void) -> Option<Arc<Self>> {
         let backend = Arc::new(Self {
             state: UnsafeCell::new(State {
+                codec,
                 cuda_context: ptr::null_mut(),
                 parser: ptr::null_mut(),
                 decoder: ptr::null_mut(),
@@ -87,6 +185,8 @@ impl Backend {
                 failed: false,
             }),
             busy: AtomicBool::new(false),
+            trace_enabled: std::env::var_os("DISCORD_NVDEC_TRACE").is_some(),
+            traced_packets: AtomicUsize::new(0),
         });
         let state = unsafe { &mut *backend.state.get() };
         let mut device = 0;
@@ -98,8 +198,18 @@ impl Backend {
             return None;
         }
 
+        let mut caps: ffi::CUVIDDECODECAPS = zeroed();
+        caps.eCodecType = codec.cuda();
+        caps.eChromaFormat = CHROMA_420;
+        if unsafe { ffi::cuvidGetDecoderCaps(&mut caps) } != 0 || caps.bIsSupported == 0 {
+            let mut previous = ptr::null_mut();
+            unsafe { ffi::cuCtxPopCurrent_v2(&mut previous) };
+            eprintln!("discord-nvdec: {} is unsupported by this GPU", codec.name());
+            return None;
+        }
+
         let mut parser: ffi::CUVIDPARSERPARAMS = zeroed();
-        parser.CodecType = HEVC;
+        parser.CodecType = codec.cuda();
         parser.ulMaxNumDecodeSurfaces = 20;
         parser.ulClockRate = 90_000;
         parser.ulMaxDisplayDelay = 0;
@@ -117,7 +227,7 @@ impl Backend {
         Some(backend)
     }
 
-    pub fn submit(&self, data: &[u8], timestamp: u32) -> Result<(), ()> {
+    pub fn submit(&self, data: &[u8], timestamp: u32, end_of_picture: bool) -> Result<(), ()> {
         if data.is_empty()
             || data.len() > u32::MAX as usize
             || self.busy.swap(true, Ordering::AcqRel)
@@ -125,19 +235,40 @@ impl Backend {
             return Err(());
         }
         let _busy = BusyGuard(&self.busy);
-        let (parser, context, failed) = unsafe {
+        let (parser, context, failed, codec) = unsafe {
             let state = &*self.state.get();
-            (state.parser, state.cuda_context, state.failed)
+            (state.parser, state.cuda_context, state.failed, state.codec)
         };
         if failed {
             return Err(());
         }
+        let payload = if codec == Codec::Av1 {
+            normalize_av1_packet(data)?
+        } else {
+            Cow::Borrowed(data)
+        };
         let _context = ContextGuard::push(context).ok_or(())?;
         let mut packet: ffi::CUVIDSOURCEDATAPACKET = zeroed();
-        packet.flags = 0x02;
-        packet.payload = data.as_ptr();
-        packet.payload_size = data.len() as _;
+        packet.flags = if end_of_picture { 0x02 | 0x08 } else { 0x02 };
+        packet.payload = payload.as_ptr();
+        packet.payload_size = payload.len() as _;
         packet.timestamp = timestamp as _;
+        if self.trace_enabled
+            && unsafe { &*self.state.get() }.codec == Codec::Av1
+            && self.traced_packets.fetch_add(1, Ordering::Relaxed) < 4
+        {
+            let header = data
+                .iter()
+                .take(16)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            eprintln!(
+                "discord-nvdec: AV1 packet size={} flags={:#x} normalized={} header={header}",
+                data.len(),
+                packet.flags,
+                matches!(payload, Cow::Owned(_))
+            );
+        }
         let result = unsafe { ffi::cuvidParseVideoData(parser, &mut packet) };
         if result == 0 && !unsafe { &*self.state.get() }.failed {
             Ok(())
@@ -195,7 +326,8 @@ unsafe extern "C" fn on_sequence(context: *mut c_void, format: *mut ffi::CUVIDEO
     let format = unsafe { &*format };
     let width = format.display_area.right - format.display_area.left;
     let height = format.display_area.bottom - format.display_area.top;
-    if format.chroma_format != CHROMA_420
+    if format.codec != state.codec.cuda()
+        || format.chroma_format != CHROMA_420
         || !matches!(format.bit_depth_luma_minus8, 0 | 2 | 4)
         || format.progressive_sequence == 0
         || width <= 0
@@ -209,12 +341,27 @@ unsafe extern "C" fn on_sequence(context: *mut c_void, format: *mut ffi::CUVIDEO
         || format.display_area.right > format.coded_width as i32
         || format.display_area.bottom > format.coded_height as i32
     {
+        if backend.trace_enabled {
+            eprintln!(
+                "discord-nvdec: sequence rejected codec={} chroma={} depth={} progressive={} coded={}x{} display=({},{})-({},{})",
+                format.codec,
+                format.chroma_format,
+                format.bit_depth_luma_minus8,
+                format.progressive_sequence,
+                format.coded_width,
+                format.coded_height,
+                format.display_area.left,
+                format.display_area.top,
+                format.display_area.right,
+                format.display_area.bottom
+            );
+        }
         state.failed = true;
         return 0;
     }
 
     let mut caps: ffi::CUVIDDECODECAPS = zeroed();
-    caps.eCodecType = HEVC;
+    caps.eCodecType = state.codec.cuda();
     caps.eChromaFormat = CHROMA_420;
     caps.nBitDepthMinus8 = format.bit_depth_luma_minus8 as _;
     if unsafe { ffi::cuvidGetDecoderCaps(&mut caps) } != 0
@@ -224,6 +371,20 @@ unsafe extern "C" fn on_sequence(context: *mut c_void, format: *mut ffi::CUVIDEO
         || format.coded_width > caps.nMaxWidth
         || format.coded_height > caps.nMaxHeight
     {
+        if backend.trace_enabled {
+            eprintln!(
+                "discord-nvdec: decoder caps rejected codec={} depth={} coded={}x{} supported={} limits={}x{}..{}x{}",
+                format.codec,
+                format.bit_depth_luma_minus8,
+                format.coded_width,
+                format.coded_height,
+                caps.bIsSupported,
+                caps.nMinWidth,
+                caps.nMinHeight,
+                caps.nMaxWidth,
+                caps.nMaxHeight
+            );
+        }
         state.failed = true;
         return 0;
     }
@@ -237,7 +398,7 @@ unsafe extern "C" fn on_sequence(context: *mut c_void, format: *mut ffi::CUVIDEO
     }
 
     let mut info: ffi::CUVIDDECODECREATEINFO = zeroed();
-    info.CodecType = HEVC;
+    info.CodecType = state.codec.cuda();
     info.ChromaFormat = CHROMA_420;
     info.bitDepthMinus8 = format.bit_depth_luma_minus8 as _;
     info.OutputFormat = if info.bitDepthMinus8 == 0 { NV12 } else { P016 };
@@ -393,35 +554,164 @@ fn copy_mapped_frame(state: &mut State, source: u64, source_pitch: usize) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::Backend;
+    use super::{Backend, Codec};
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    static FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct FrameResult {
+        count: AtomicUsize,
+        invalid: AtomicBool,
+    }
 
-    fn on_frame(_: *mut c_void, frame: &[u8], width: i32, height: i32, _: u32) {
-        assert_eq!((width, height), (256, 144));
-        assert_eq!(frame.len(), 256 * 144 * 3 / 2);
-        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+    fn on_frame(context: *mut c_void, frame: &[u8], width: i32, height: i32, _: u32) {
+        let result = unsafe { &*(context as *const FrameResult) };
+        if (width, height) != (256, 144) || frame.len() != 256 * 144 * 3 / 2 {
+            result.invalid.store(true, Ordering::Relaxed);
+        }
+        result.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decode_stream(codec: Codec, packets: impl IntoIterator<Item = (Vec<u8>, u32, bool)>) {
+        let result = FrameResult {
+            count: AtomicUsize::new(0),
+            invalid: AtomicBool::new(false),
+        };
+        let backend = Backend::new(
+            codec,
+            on_frame,
+            (&result as *const FrameResult).cast_mut().cast(),
+        )
+        .expect("GPU codec support");
+        for (packet, timestamp, end_of_picture) in packets {
+            backend.submit(&packet, timestamp, end_of_picture).unwrap();
+        }
+        backend.flush().unwrap();
+        assert_eq!(result.count.load(Ordering::Relaxed), 2);
+        assert!(!result.invalid.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn maps_discord_video_codecs() {
+        assert_eq!(Codec::from_webrtc(1), Some(Codec::Vp8));
+        assert_eq!(Codec::from_webrtc(3), Some(Codec::Av1));
+        assert_eq!(Codec::from_webrtc(4), Some(Codec::H264));
+        assert_eq!(Codec::from_webrtc(5), Some(Codec::Hevc));
+        assert_eq!(Codec::from_webrtc(2), None);
     }
 
     #[test]
     fn decodes_hevc_main() {
-        FRAME_COUNT.store(0, Ordering::Relaxed);
-        let video = include_bytes!("../tests/fixtures/hevc-main.h265");
-        let backend = Backend::new(on_frame, std::ptr::null_mut()).unwrap();
-        backend.submit(video, 1234).unwrap();
-        backend.flush().unwrap();
-        assert_eq!(FRAME_COUNT.load(Ordering::Relaxed), 2);
+        decode_stream(
+            Codec::Hevc,
+            [(
+                include_bytes!("../tests/fixtures/hevc-main.h265").to_vec(),
+                1234,
+                false,
+            )],
+        );
     }
 
     #[test]
     fn decodes_hevc_main10() {
-        FRAME_COUNT.store(0, Ordering::Relaxed);
-        let video = include_bytes!("../tests/fixtures/hevc-main10.h265");
-        let backend = Backend::new(on_frame, std::ptr::null_mut()).unwrap();
-        backend.submit(video, 1234).unwrap();
+        decode_stream(
+            Codec::Hevc,
+            [(
+                include_bytes!("../tests/fixtures/hevc-main10.h265").to_vec(),
+                1234,
+                false,
+            )],
+        );
+    }
+
+    #[test]
+    fn decodes_h264() {
+        decode_stream(
+            Codec::H264,
+            [(
+                include_bytes!("../tests/fixtures/h264.h264").to_vec(),
+                1234,
+                false,
+            )],
+        );
+    }
+
+    #[test]
+    fn decodes_av1() {
+        let video = include_bytes!("../tests/fixtures/av1.ivf");
+        assert_eq!(&video[..4], b"DKIF");
+        let mut offset = 32;
+        let mut packets = Vec::new();
+        while offset + 12 <= video.len() {
+            let size = u32::from_le_bytes(video[offset..offset + 4].try_into().unwrap()) as usize;
+            let timestamp = u64::from_le_bytes(video[offset + 4..offset + 12].try_into().unwrap());
+            offset += 12;
+            packets.push((
+                video[offset..offset + size].to_vec(),
+                timestamp as u32,
+                true,
+            ));
+            offset += size;
+        }
+        assert_eq!(offset, video.len());
+        decode_stream(Codec::Av1, packets);
+    }
+
+    #[test]
+    fn decodes_batched_av1_stream() {
+        decode_stream(
+            Codec::Av1,
+            [(
+                include_bytes!("../tests/fixtures/av1.obu").to_vec(),
+                1234,
+                false,
+            )],
+        );
+    }
+
+    #[test]
+    fn decodes_av1_packet_without_last_obu_size() {
+        let video = include_bytes!("../tests/fixtures/av1.ivf");
+        let size = u32::from_le_bytes(video[32..36].try_into().unwrap()) as usize;
+        let frame = &video[44..44 + size];
+        assert_eq!(&frame[..2], &[0x12, 0]);
+        assert_eq!(frame[15], 0x32);
+        let mut packet = frame[2..16].to_vec();
+        packet[13] = 0x30;
+        packet.extend_from_slice(&frame[18..]);
+        let result = FrameResult {
+            count: AtomicUsize::new(0),
+            invalid: AtomicBool::new(false),
+        };
+        let backend = Backend::new(
+            Codec::Av1,
+            on_frame,
+            (&result as *const FrameResult).cast_mut().cast(),
+        )
+        .unwrap();
+        backend.submit(&packet, 1234, true).unwrap();
         backend.flush().unwrap();
-        assert_eq!(FRAME_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(result.count.load(Ordering::Relaxed), 1);
+        assert!(!result.invalid.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn decodes_vp8() {
+        let video = include_bytes!("../tests/fixtures/vp8.ivf");
+        assert_eq!(&video[..4], b"DKIF");
+        let mut offset = 32;
+        let mut packets = Vec::new();
+        while offset + 12 <= video.len() {
+            let size = u32::from_le_bytes(video[offset..offset + 4].try_into().unwrap()) as usize;
+            let timestamp = u64::from_le_bytes(video[offset + 4..offset + 12].try_into().unwrap());
+            offset += 12;
+            packets.push((
+                video[offset..offset + size].to_vec(),
+                timestamp as u32,
+                true,
+            ));
+            offset += size;
+        }
+        assert_eq!(offset, video.len());
+        decode_stream(Codec::Vp8, packets);
     }
 }

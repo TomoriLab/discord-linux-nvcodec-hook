@@ -1,5 +1,5 @@
 use crate::elf::{self, Symbols};
-use crate::nvdec::Backend;
+use crate::nvdec::{Backend, Codec};
 use std::ffi::OsStr;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::mem;
@@ -55,6 +55,7 @@ unsafe extern "C" {
 #[repr(C)]
 struct Decoder {
     vtable: *const usize,
+    codec: Codec,
     state: Mutex<DecoderState>,
 }
 
@@ -273,9 +274,8 @@ unsafe extern "C" fn hooked_create(
         return ptr::null_mut();
     };
     let codec_type: CodecType = unsafe { mem::transmute(addresses.get(elf::CODEC_TYPE)) };
-    if unsafe { codec_type(format) } == 5 {
-        eprintln!("discord-nvdec: HEVC selected for NVDEC decoding");
-        return Box::into_raw(Box::new(Decoder {
+    if let Some(codec) = Codec::from_webrtc(unsafe { codec_type(format) }) {
+        let mut decoder = Box::new(Decoder {
             vtable: DECODER_VTABLE
                 .get_or_init(|| {
                     [
@@ -292,12 +292,24 @@ unsafe extern "C" fn hooked_create(
                     ]
                 })
                 .as_ptr(),
+            codec,
             state: Mutex::new(DecoderState {
                 backend: None,
                 callback: ptr::null_mut(),
             }),
-        }))
-        .cast();
+        });
+        if let Some(backend) = Backend::new(
+            codec,
+            on_nvdec_frame,
+            (&mut *decoder as *mut Decoder).cast(),
+        ) {
+            decoder.state.lock().expect("new decoder state").backend = Some(backend);
+            eprintln!(
+                "discord-nvdec: {} selected for NVDEC decoding",
+                codec.name()
+            );
+            return Box::into_raw(decoder).cast();
+        }
     }
     let original: FactoryCreate =
         unsafe { mem::transmute(ORIGINAL_CREATE.load(Ordering::Acquire)) };
@@ -323,15 +335,20 @@ unsafe extern "C" fn decoder_configure(decoder: *mut Decoder, settings: *const u
         return false;
     }
     let codec_type = unsafe { ptr::read_unaligned(settings.add(0x14).cast::<i32>()) };
-    if codec_type != 5 {
+    let decoder = unsafe { &*decoder };
+    if Codec::from_webrtc(codec_type) != Some(decoder.codec) {
         return false;
     }
-    let backend = Backend::new(on_nvdec_frame, decoder.cast());
-    let decoder = unsafe { &*decoder };
     let Ok(mut state) = decoder.state.lock() else {
         return false;
     };
-    state.backend = backend;
+    if state.backend.is_none() {
+        state.backend = Backend::new(
+            decoder.codec,
+            on_nvdec_frame,
+            (decoder as *const Decoder).cast_mut().cast(),
+        );
+    }
     state.backend.is_some()
 }
 
@@ -364,7 +381,7 @@ unsafe extern "C" fn decoder_decode(
         .ok()
         .and_then(|state| state.backend.clone());
     match backend {
-        Some(backend) if backend.submit(image, timestamp).is_ok() => 0,
+        Some(backend) if backend.submit(image, timestamp, true).is_ok() => 0,
         _ => -1,
     }
 }
